@@ -2,12 +2,99 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class IssueManager {
+    private static final int MAX_TITLE_LENGTH = 100;
+    private static final int MAX_DESCRIPTION_LENGTH = 1000;
+    private static final int MAX_LOCATION_LENGTH = 150;
 
+    private final DataStore store;
     private List<Issue> issues = new ArrayList<>();
+    private int nextId = 1;
+
+    public IssueManager(DataStore store) {
+        if (store == null) {
+            throw new IllegalArgumentException("DataStore is required.");
+        }
+        this.store = store;
+        this.issues = store.loadIssues();
+        this.nextId = store.loadNextIssueId(issues);
+    }
+
+    // ── Validate issue input ─────────────────────────────────
+    public String validateIssue(String title, String description, String location, String reportedBy) {
+        String cleanTitle = title == null ? "" : title.trim();
+        String cleanDescription = description == null ? "" : description.trim();
+        String cleanLocation = location == null ? "" : location.trim();
+
+        if (cleanTitle.isEmpty()) {
+            return "Issue title is required.";
+        }
+        if (cleanTitle.length() > MAX_TITLE_LENGTH) {
+            return "Issue title must be at most " + MAX_TITLE_LENGTH + " characters.";
+        }
+        if (cleanDescription.isEmpty()) {
+            return "Issue description is required.";
+        }
+        if (cleanDescription.length() > MAX_DESCRIPTION_LENGTH) {
+            return "Issue description must be at most " + MAX_DESCRIPTION_LENGTH + " characters.";
+        }
+        if (cleanLocation.isEmpty()) {
+            return "Issue location is required.";
+        }
+        if (cleanLocation.length() > MAX_LOCATION_LENGTH) {
+            return "Issue location must be at most " + MAX_LOCATION_LENGTH + " characters.";
+        }
+        if (hasActiveDuplicate(reportedBy, cleanTitle, cleanLocation)) {
+            return "You already reported this issue at this location.";
+        }
+        return null;
+    }
+
+    public String validateIssue(Issue issue) {
+        return validateIssue(
+                issue.getTitle(),
+                issue.getDescription(),
+                issue.getLocation(),
+                issue.getReportedBy());
+    }
+
+    private boolean hasActiveDuplicate(String reportedBy, String title, String location) {
+        if (reportedBy == null) return false;
+        for (Issue issue : issues) {
+            boolean active = issue.getStatus().equalsIgnoreCase("Pending")
+                    || issue.getStatus().equalsIgnoreCase("In Progress");
+            if (active
+                    && issue.getReportedBy().equalsIgnoreCase(reportedBy)
+                    && issue.getTitle().equalsIgnoreCase(title)
+                    && issue.getLocation().equalsIgnoreCase(location)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // ── Add ──────────────────────────────────────────────────
-    public void addIssue(Issue issue) {
+    public boolean addIssue(Issue issue) {
+        if (validateIssue(issue) != null) {
+            return false;
+        }
+
+        int assignedId = nextId;
+        issue.assignId(assignedId);
         issues.add(issue);
+        nextId = assignedId + 1;
+
+        try {
+            // Metadata first: if the issue file write fails, the rollback below
+            // keeps memory and disk consistent (the counter may skip one ID,
+            // but an ID is never reused).
+            store.saveNextIssueId(nextId);
+            store.saveIssues(issues);
+        } catch (DataStoreException e) {
+            issues.remove(issue);
+            nextId = assignedId;
+            throw e;
+        }
+        return true;
     }
 
     // ── Get by ID ────────────────────────────────────────────
@@ -20,7 +107,7 @@ public class IssueManager {
 
     // ── All issues ───────────────────────────────────────────
     public List<Issue> getAllIssues() {
-        return issues;
+        return new ArrayList<>(issues);
     }
 
     // ── Issues by citizen ────────────────────────────────────
@@ -32,6 +119,88 @@ public class IssueManager {
             }
         }
         return result;
+    }
+
+    // ── Update status ────────────────────────────────────────
+    public boolean updateStatus(int id, String status) {
+        if (!isAllowed(status, Issue.STATUSES)) return false;
+        Issue issue = getById(id);
+        if (issue == null) return false;
+
+        String previous = issue.getStatus();
+        if (status.equals(previous)) return true;
+
+        issue.setStatus(status);
+        try {
+            store.saveIssues(issues);
+        } catch (DataStoreException e) {
+            issue.setStatus(previous);
+            throw e;
+        }
+        return true;
+    }
+
+    // ── Assign department ────────────────────────────────────
+    public boolean assignDepartment(int id, String department) {
+        if (!isAllowed(department, Issue.DEPARTMENTS)) return false;
+        Issue issue = getById(id);
+        if (issue == null) return false;
+
+        String previous = issue.getDepartment();
+        if (department.equals(previous)) return true;
+
+        issue.setDepartment(department);
+        try {
+            store.saveIssues(issues);
+        } catch (DataStoreException e) {
+            issue.setDepartment(previous);
+            throw e;
+        }
+        return true;
+    }
+
+    // ── Update priority ──────────────────────────────────────
+    public boolean updatePriority(int id, String priority) {
+        if (!isAllowed(priority, Issue.PRIORITIES)) return false;
+        Issue issue = getById(id);
+        if (issue == null) return false;
+
+        String previous = issue.getPriority();
+        if (priority.equals(previous)) return true;
+
+        issue.setPriority(priority);
+        try {
+            store.saveIssues(issues);
+        } catch (DataStoreException e) {
+            issue.setPriority(previous);
+            throw e;
+        }
+        return true;
+    }
+
+    // ── Delete issue ─────────────────────────────────────────
+    public boolean deleteIssue(int id) {
+        Issue issue = getById(id);
+        if (issue == null) return false;
+
+        int index = issues.indexOf(issue);
+        issues.remove(index);
+        try {
+            store.saveIssues(issues);
+        } catch (DataStoreException e) {
+            issues.add(index, issue);
+            throw e;
+        }
+        return true;
+    }
+
+    private boolean isAllowed(String value, String[] allowed) {
+        for (String option : allowed) {
+            if (option.equals(value)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ── Count by status (used for statistics) ────────────────
@@ -50,38 +219,6 @@ public class IssueManager {
             if (i.getPriority().equalsIgnoreCase("Critical")) count++;
         }
         return count;
-    }
-
-    // ── Update status ────────────────────────────────────────
-    public boolean updateStatus(int id, String status) {
-        Issue issue = getById(id);
-        if (issue == null) return false;
-        issue.setStatus(status);
-        return true;
-    }
-
-    // ── Assign department ────────────────────────────────────
-    public boolean assignDepartment(int id, String department) {
-        Issue issue = getById(id);
-        if (issue == null) return false;
-        issue.setDepartment(department);
-        return true;
-    }
-
-    // ── Update priority ──────────────────────────────────────
-    public boolean updatePriority(int id, String priority) {
-        Issue issue = getById(id);
-        if (issue == null) return false;
-        issue.setPriority(priority);
-        return true;
-    }
-
-    // ── Delete issue ─────────────────────────────────────────
-    public boolean deleteIssue(int id) {
-        Issue issue = getById(id);
-        if (issue == null) return false;
-        issues.remove(issue);
-        return true;
     }
 
     // ── Statistics ───────────────────────────────────────────

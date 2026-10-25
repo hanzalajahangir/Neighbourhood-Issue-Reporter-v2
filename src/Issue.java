@@ -2,8 +2,6 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
 public class Issue {
-    private static int counter = 1;
-
     private int id;
     private String title;
     private String description;
@@ -22,7 +20,6 @@ public class Issue {
 
     public Issue(String title, String description, String location,
                  String category, String priority, String reportedBy) {
-        this.id          = counter++;
         this.title       = title;
         this.description = description;
         this.location    = location;
@@ -32,6 +29,25 @@ public class Issue {
         this.department  = "Unassigned";
         this.reportedBy  = reportedBy;
         this.dateReported = LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm"));
+    }
+
+    /**
+     * Restores an issue exactly as it was saved, including its ID and timestamp.
+     * Used only by {@link DataStore} when loading from disk.
+     */
+    Issue(int id, String title, String description, String location,
+          String category, String priority, String status, String department,
+          String reportedBy, String dateReported) {
+        this.id           = id;
+        this.title        = title;
+        this.description  = description;
+        this.location     = location;
+        this.category     = category;
+        this.priority     = priority;
+        this.status       = status;
+        this.department   = department;
+        this.reportedBy   = reportedBy;
+        this.dateReported = dateReported;
     }
 
     public int    getId()           { return id; }
@@ -48,6 +64,9 @@ public class Issue {
     public void setStatus(String status)         { this.status = status; }
     public void setDepartment(String department) { this.department = department; }
     public void setPriority(String priority)     { this.priority = priority; }
+
+    // Assigned by IssueManager when the issue is added to the store.
+    void assignId(int id) { this.id = id; }
 
     public void printSummary() {
         System.out.println("  +-----------------------------------------------+");

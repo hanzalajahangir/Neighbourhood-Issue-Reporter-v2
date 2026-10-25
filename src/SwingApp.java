@@ -11,8 +11,9 @@ public class SwingApp extends JFrame {
     private static final Color PRIMARY = new Color(37, 99, 235);
     private static final Dimension AUTH_FIELD_SIZE = new Dimension(320, 34);
 
-    private final IssueManager issueManager = new IssueManager();
-    private final UserManager userManager = new UserManager();
+    private final DataStore store;
+    private final IssueManager issueManager;
+    private final UserManager userManager;
 
     private User currentUser;
     private JTable issueTable;
@@ -20,13 +21,41 @@ public class SwingApp extends JFrame {
     private JLabel titleLabel;
     private JLabel statsLabel;
 
-    public SwingApp() {
+    public SwingApp(DataStore store) {
+        if (store == null) {
+            throw new IllegalArgumentException("DataStore is required.");
+        }
+        this.store = store;
+        this.userManager = new UserManager(store);
+        this.issueManager = new IssueManager(store);
+
         setTitle("Neighbourhood Issue Reporter");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setSize(980, 620);
         setLocationRelativeTo(null);
         setMinimumSize(new Dimension(820, 520));
         showAuthPanel();
+    }
+
+    /**
+     * Shows any problems recorded while loading data (for example, a corrupt
+     * file that was backed up). Called once after the window becomes visible.
+     */
+    public void showStartupWarnings() {
+        List<String> warnings = store.getWarnings();
+        if (warnings.isEmpty()) {
+            return;
+        }
+
+        StringBuilder message = new StringBuilder("Some saved data could not be loaded:\n\n");
+        for (String warning : warnings) {
+            message.append("- ").append(warning).append("\n\n");
+        }
+        JOptionPane.showMessageDialog(
+                this,
+                message.toString().trim(),
+                "Data Warning",
+                JOptionPane.WARNING_MESSAGE);
     }
 
     private void showAuthPanel() {
@@ -100,14 +129,20 @@ public class SwingApp extends JFrame {
         registerButton.addActionListener(e -> {
             String name = nameField.getText().trim();
             String username = usernameField.getText().trim();
-            String password = new String(passwordField.getPassword()).trim();
+            String password = new String(passwordField.getPassword());
 
-            if (name.isEmpty() || username.isEmpty() || password.isEmpty()) {
-                showError("Please fill in all registration fields.");
+            String error = userManager.validateRegistration(username, password, name);
+            if (error != null) {
+                showError(error);
                 return;
             }
-            if (!userManager.register(username, password, name)) {
-                showError("That username is already taken.");
+            try {
+                if (!userManager.register(username, password, name)) {
+                    showError("Registration failed. Please review your details.");
+                    return;
+                }
+            } catch (DataStoreException ex) {
+                showSaveError(ex);
                 return;
             }
 
@@ -247,6 +282,7 @@ public class SwingApp extends JFrame {
         };
         issueTable = new JTable(issueTableModel);
         issueTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        issueTable.setAutoCreateRowSorter(true);
         issueTable.setRowHeight(24);
         issueTable.getTableHeader().setReorderingAllowed(false);
 
@@ -264,14 +300,17 @@ public class SwingApp extends JFrame {
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 8));
         actions.setOpaque(false);
 
-        JButton reportButton = new JButton("Report Issue");
+        if (!isAdmin()) {
+            JButton reportButton = new JButton("Report Issue");
+            reportButton.addActionListener(e -> showIssueForm());
+            actions.add(reportButton);
+        }
+
         JButton detailsButton = new JButton("View Details");
         JButton refreshButton = new JButton("Refresh");
-        reportButton.addActionListener(e -> showIssueForm());
         detailsButton.addActionListener(e -> showSelectedIssueDetails());
         refreshButton.addActionListener(e -> refreshDashboard());
 
-        actions.add(reportButton);
         actions.add(detailsButton);
         actions.add(refreshButton);
 
@@ -299,6 +338,11 @@ public class SwingApp extends JFrame {
     }
 
     private void showIssueForm() {
+        if (isAdmin()) {
+            showError("Only citizens can report issues.");
+            return;
+        }
+
         JTextField titleField = new JTextField();
         JTextArea descriptionArea = new JTextArea(4, 24);
         JTextField locationField = new JTextField();
@@ -312,24 +356,41 @@ public class SwingApp extends JFrame {
         addField(form, "Category", categoryBox);
         addField(form, "Priority", priorityBox);
 
-        int choice = JOptionPane.showConfirmDialog(this, form, "Report New Issue", JOptionPane.OK_CANCEL_OPTION);
-        if (choice != JOptionPane.OK_OPTION) return;
+        String title = "";
+        String description = "";
+        String location = "";
+        while (true) {
+            int choice = JOptionPane.showConfirmDialog(
+                    this, form, "Report New Issue", JOptionPane.OK_CANCEL_OPTION);
+            if (choice != JOptionPane.OK_OPTION) return;
 
-        String title = titleField.getText().trim();
-        if (title.isEmpty()) {
-            showError("Issue title is required.");
-            return;
+            title = titleField.getText().trim();
+            description = descriptionArea.getText().trim();
+            location = locationField.getText().trim();
+
+            String error = issueManager.validateIssue(
+                    title, description, location, currentUser.getUsername());
+            if (error == null) break;
+            showError(error);
         }
 
         Issue issue = new Issue(
                 title,
-                descriptionArea.getText().trim(),
-                locationField.getText().trim(),
+                description,
+                location,
                 (String) categoryBox.getSelectedItem(),
                 (String) priorityBox.getSelectedItem(),
                 currentUser.getUsername()
         );
-        issueManager.addIssue(issue);
+        try {
+            if (!issueManager.addIssue(issue)) {
+                showError("Unable to report this issue.");
+                return;
+            }
+        } catch (DataStoreException ex) {
+            showSaveError(ex);
+            return;
+        }
         refreshDashboard();
         JOptionPane.showMessageDialog(this, "Issue #" + issue.getId() + " reported.");
     }
@@ -355,15 +416,15 @@ public class SwingApp extends JFrame {
             });
         }
 
-        statsLabel.setText("Total: " + issueManager.getAllIssues().size()
-                + "    Pending: " + countStatus("Pending")
-                + "    In Progress: " + countStatus("In Progress")
-                + "    Resolved: " + countStatus("Resolved"));
+        statsLabel.setText("Total: " + issues.size()
+                + "    Pending: " + countStatus(issues, "Pending")
+                + "    In Progress: " + countStatus(issues, "In Progress")
+                + "    Resolved: " + countStatus(issues, "Resolved"));
     }
 
-    private int countStatus(String status) {
+    private int countStatus(List<Issue> issues, String status) {
         int count = 0;
-        for (Issue issue : issueManager.getAllIssues()) {
+        for (Issue issue : issues) {
             if (issue.getStatus().equalsIgnoreCase(status)) {
                 count++;
             }
@@ -408,12 +469,21 @@ public class SwingApp extends JFrame {
         );
         if (selected == null) return;
 
-        if (label.equals("Status")) {
-            issueManager.updateStatus(issue.getId(), selected);
-        } else if (label.equals("Department")) {
-            issueManager.assignDepartment(issue.getId(), selected);
-        } else {
-            issueManager.updatePriority(issue.getId(), selected);
+        try {
+            boolean updated;
+            if (label.equals("Status")) {
+                updated = issueManager.updateStatus(issue.getId(), selected);
+            } else if (label.equals("Department")) {
+                updated = issueManager.assignDepartment(issue.getId(), selected);
+            } else {
+                updated = issueManager.updatePriority(issue.getId(), selected);
+            }
+            if (!updated) {
+                showError("Unable to update issue #" + issue.getId() + ".");
+                return;
+            }
+        } catch (DataStoreException ex) {
+            showSaveError(ex);
         }
         refreshDashboard();
     }
@@ -429,7 +499,15 @@ public class SwingApp extends JFrame {
                 JOptionPane.YES_NO_OPTION
         );
         if (confirm == JOptionPane.YES_OPTION) {
-            issueManager.deleteIssue(issue.getId());
+            try {
+                if (!issueManager.deleteIssue(issue.getId())) {
+                    showError("Unable to delete issue #" + issue.getId() + ".");
+                    return;
+                }
+            } catch (DataStoreException ex) {
+                showSaveError(ex);
+                return;
+            }
             refreshDashboard();
         }
     }
@@ -468,5 +546,13 @@ public class SwingApp extends JFrame {
 
     private void showError(String message) {
         JOptionPane.showMessageDialog(this, message, "Error", JOptionPane.ERROR_MESSAGE);
+    }
+
+    private void showSaveError(DataStoreException ex) {
+        JOptionPane.showMessageDialog(
+                this,
+                "Your change could not be saved, so it was not applied.\n\n" + ex.getMessage(),
+                "Save Error",
+                JOptionPane.ERROR_MESSAGE);
     }
 }

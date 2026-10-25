@@ -4,6 +4,10 @@ public class Admin extends User {
         super(username, password, name);
     }
 
+    Admin(String username, String name, String passwordHash, String salt, int iterations) {
+        super(username, name, passwordHash, salt, iterations);
+    }
+
     @Override
     public String getRole() { return "Admin"; }
 }
