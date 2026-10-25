@@ -26,7 +26,9 @@ A desktop application built with **Java Swing** that lets citizens report local 
 The app models two kinds of users — **Citizens** and **Admins** — who share a single login/registration screen and are then routed into a role-aware dashboard:
 
 - **Citizens** can register, log in, submit new issues, and view/track only the issues they personally reported.
-- **Admins** can see every issue in the system, update its status/priority/department, delete issues, and view the full list of registered users.
+- **Admins** can see every issue in the system, update its status/priority/department, delete issues, view registered accounts, and create/remove admin accounts.
+- Both roles can search and filter the dashboard, and change their own password.
+- Admins can create and remove other admin accounts. The seeded default password is detected at login and the admin is prompted to change it.
 
 Users, password hashes, and issues are **saved to plain-text files under `data/`** in the working directory, so they survive restarts. Every change is written immediately, and writes are atomic with a `.bak` copy of the previous version.
 
@@ -38,14 +40,22 @@ Users, password hashes, and issues are **saved to plain-text files under `data/`
 - 🛟 Atomic writes with a `.bak` copy, plus timestamped backups of corrupt files
 - 📝 Issue reporting with title, description, location, category, and priority
 - ✅ Input validation: required fields, length limits, and duplicate active-issue detection
-- 📊 Live dashboard with a sortable table view and summary statistics (Total / Pending / In Progress / Resolved)
+- 📊 Live dashboard with a sortable table view (dates sort chronologically) and summary statistics (Showing X of Y / Pending / In Progress / Resolved)
+- 🔎 Live search and filters above the table: free text, status, category, priority, department, and reported-date ranges
+- ⌨️ Keyboard shortcuts: `Ctrl+F` focuses search, `Esc` clears all filters
 - 🔍 Issue detail view via a dialog popup
+- 🔑 Account management:
+  - Change your own password (with current-password verification and confirmation)
+  - Admins can create additional admin accounts
+  - Admins can remove other admins, but not themselves or the last remaining admin
+  - Default admin password is detected at login and the admin is prompted to change it
 - 🛠️ Admin-only controls:
   - Update issue status
   - Assign a department
   - Update priority
   - Delete an issue
   - View all registered users
+  - Create or remove admin accounts
 - 🎨 Custom-styled Swing UI (card-style forms, consistent color palette, tabbed auth screen)
 
 ## Tech Stack
@@ -70,9 +80,10 @@ Users, password hashes, and issues are **saved to plain-text files under `data/`
 │   ├── User.java              # Abstract base class (password hashing lives here)
 │   ├── Citizen.java           # Citizen role (extends User)
 │   ├── Admin.java             # Admin role (extends User)
-│   ├── UserManager.java       # User store: validation, registration, login, persistence
+│   ├── UserManager.java       # User store: registration, account management, login, persistence
 │   ├── Issue.java             # Issue data model + console-print helpers
 │   ├── IssueManager.java      # Issue store: validation, CRUD, statistics, persistence
+│   ├── IssueFilter.java       # Swing-free search/filter rules for the issue table
 │   ├── DataStore.java         # File persistence: load/save, backups, corruption handling
 │   ├── Csv.java               # Minimal RFC 4180 CSV reader/writer
 │   └── DataStoreException.java # Unchecked error raised when data cannot be loaded/saved
@@ -92,7 +103,8 @@ Users, password hashes, and issues are **saved to plain-text files under `data/`
 The project follows a light **MVC-like separation**:
 
 - **Model**: `User` (and subclasses `Citizen`, `Admin`), `Issue`
-- **"Service" / data layer**: `UserManager`, `IssueManager` — encapsulate all business logic (validation, registration, login, CRUD, filtering, statistics, persistence) so the UI layer never manipulates raw lists directly
+- **"Service" / data layer**: `UserManager`, `IssueManager` — encapsulate business logic (validation, registration/login, account management, CRUD, statistics, persistence) so the UI layer never manipulates raw lists directly
+- **Filtering**: `IssueFilter` — pure, Swing-free matching rules for text, status, category, priority, department, and time range
 - **Persistence layer**: `DataStore` (with `Csv` for encoding) — owns `data/`, loads records on construction, and writes after each change
 - **View / Controller**: `SwingApp` — builds all Swing components, wires up `ActionListener`s, and calls into the managers
 
@@ -123,6 +135,10 @@ User repository backed by `DataStore`.
 - Seeds one default `Admin` (`admin` / `admin123`) only when no admin account exists; if the username `admin` is already taken, it uses `admin2`, `admin3`, etc. Fresh installations therefore always have exactly one admin.
 - `validateRegistration(username, password, name)` — returns a human-readable error message, or `null` if the input is valid. Enforces a 3–30 character username (letters, numbers, `.`, `_`, `-`), a 6–100 character password, a non-empty name of at most 60 characters, and username uniqueness.
 - `register(username, password, name)` — validates, creates a new `Citizen`, and saves immediately. If the save fails, the in-memory addition is rolled back and a `DataStoreException` is thrown.
+- `validateAdminCreation` / `createAdmin` — apply the same account rules, reject the public default password, create an `Admin`, and save immediately (rolling back on failure).
+- `validateAdminRemoval` / `removeAdmin` — enforce that the actor is an admin, the target is an admin, the actor is not removing themselves, and at least one admin remains.
+- `validatePasswordChange` / `changePassword` — verify the current password, enforce the 6–100 character rule and a changed value, reject the default admin password for admins, re-hash with a fresh salt, save immediately, and restore the old credentials if the save fails.
+- `isUsingDefaultAdminPassword(user)` — detects an admin still using the seeded demo password so the UI can prompt for a change.
 - `login(username, password)` — validates credentials and returns the matching `User`, or `null`.
 - `findByUsername(username)` — case-insensitive lookup.
 - `getAllUsers()` — returns a defensive copy of the user list.
@@ -144,11 +160,19 @@ Data model for a reported issue.
 Issue repository backed by `DataStore`.
 - Loads `data/issues.csv` and the next issue ID on construction. The next ID is `max(stored next ID, highest loaded ID + 1)`, so a missing/stale `meta.properties` cannot cause ID reuse.
 - `validateIssue(title, description, location, reportedBy)` — returns a human-readable error message, or `null` if valid. Requires all three text fields, caps title/description/location at 100/1000/150 characters, and rejects a duplicate *active* issue (same reporter, title, and location while status is Pending or In Progress).
-- `addIssue(Issue)` — validates, assigns the next ID, and saves immediately; returns `false` if validation fails. If saving fails, the issue and ID counter are rolled back and a `DataStoreException` is thrown.
+- `addIssue(Issue)` — validates, assigns the next ID, and saves immediately; returns `false` if validation fails. The counter is written first: if that write fails, the issue and counter are rolled back; if the issue write then fails, the issue is rolled back but the persisted ID stays consumed, so IDs are never reused.
 - `getById(id)`, `getAllIssues()` (defensive copy), `getByUser(username)`
 - `updateStatus`, `assignDepartment`, `updatePriority`, `deleteIssue` — validate the new value, save immediately, and roll back the affected issue if the save fails. All return `boolean` success/failure based on whether the issue was found.
 - `printStatistics()` — console summary (total / pending / in progress / resolved / critical)
 - `printList(List<Issue>)` — console listing helper
+
+### `IssueFilter`
+Swing-free filtering rules used by the dashboard.
+- Free-text search is case-insensitive and covers title, description, location, and reporter.
+- Dropdown filters for status, category, priority, and department (including `Unassigned`).
+- Time presets: Any time, Today, Last 7 days (today plus the previous six), Last 30 days.
+- `matches(issue)` evaluates all active conditions with AND; `apply(issues)` returns a new filtered list in the original order.
+- `All` / `Any time` values disable the corresponding condition.
 
 ### `DataStore`
 Owns the `data/` directory and all file I/O.
@@ -157,7 +181,7 @@ Owns the `data/` directory and all file I/O.
 - `saveUsers(users)` / `saveIssues(issues)` / `saveNextIssueId(id)` — write UTF-8 content to a temporary file in `data/`, copy the current file to `<file>.bak`, then atomically replace the original (falling back to a normal replace where atomic moves are unsupported).
 - **Corrupt file handling** — renames an unreadable `users.csv` / `issues.csv` to `<file>.corrupt-<yyyyMMdd-HHmmss>` (adding `-1`, `-2`, … on collision), records a warning, and starts that dataset fresh. An unreadable `meta.properties` produces a warning instead, and the ID counter is rebuilt from the loaded issues.
 - `getWarnings()` — warnings collected during loading, shown once at startup.
-- Throws `DataStoreException` when data cannot be read or written.
+- Throws `DataStoreException` when the data directory cannot be created or a save cannot be completed; unreadable CSV files are quarantined and reported through warnings instead.
 
 ### `Csv`
 Small RFC 4180 reader/writer used by `DataStore`. Handles quoted fields, escaped quotes (`""`), commas, multiline values, CRLF/LF, UTF-8 BOMs, and blank lines. The writer quotes any value containing a comma, quote, newline, or leading/trailing whitespace.
@@ -170,10 +194,14 @@ The single `JFrame` that drives the entire UI.
 - Receives the shared `DataStore` and injects it into `UserManager` and `IssueManager`.
 - `showStartupWarnings()` — displays any data warnings (for example, a corrupt file that was backed up) after the window opens.
 - **Auth screen** (`showAuthPanel`): tabbed pane with `Login` and `Register` forms, built with reusable `createFormPanel` / `addAuthField` / `addAuthButton` helpers for consistent styling.
-- **Dashboard** (`showDashboard`): header with welcome message + live stats, a `JTable` of issues (columns: ID, Title, Category, Priority, Status, Department, Location, Reported By, Date), and an action bar.
+- **Dashboard** (`showDashboard`): header with welcome message + live stats, a filter bar, a `JTable` of issues (columns: ID, Title, Category, Priority, Status, Department, Location, Reported By, Date), and an action bar.
+- **Filter bar** (`createFilterBar`): search field, status/category/priority/department dropdowns, time-range presets, and *Clear Filters*. Filtering is applied live to the role-scoped issue list, and the stats show filtered counts plus `Showing X of Y`.
+- **Keyboard shortcuts**: `Ctrl+F` focuses the search box; `Esc` clears all filters.
+- **Account controls**: *Change Password* is available to both roles next to *Logout*. Admins see *Users*, which opens a dialog with *Create Admin* and *Remove Admin* actions.
 - **Action bar** (`createActionPanel`): shows *View Details* and *Refresh* for everyone; *Report Issue* only for citizens; and *Update Status*, *Assign Department*, *Update Priority*, *Delete*, and *Users* for admins (when `isAdmin()` is true).
-- Issue creation, detail viewing, status/priority/department updates, deletion, and user listing are all handled via `JOptionPane` dialogs built from small `JTextField`/`JComboBox`/`JTextArea` forms.
+- Issue creation, detail viewing, status/priority/department updates, deletion, account management, and password changes are all handled via `JOptionPane` dialogs built from small `JTextField`/`JComboBox`/`JTextArea` forms.
 - If a save fails, the action is rolled back and a **Save Error** dialog explains that the change was not applied.
+- After login, an admin still using the seeded default password is offered an immediate password change.
 
 ## Getting Started
 
@@ -207,19 +235,25 @@ On first run the app creates a `data/` directory **in the directory you launch i
 
 1. **Launch** the app — you'll land on the Login/Register screen.
 2. **Register** as a citizen (full name, a 3–30 character username, and a password of at least 6 characters), or **log in** with the seeded admin account.
-3. **As a Citizen**:
+3. **Filter the dashboard**:
+   - Type in **Search** to match title, description, location, or reporter.
+   - Use the **Status**, **Category**, **Priority**, and **Department** dropdowns to narrow the table. Department includes **Unassigned**.
+   - Use **Reported** for Any time / Today / Last 7 days / Last 30 days.
+   - Filters combine with AND and update the table live. **Clear Filters** (or `Esc`) resets them; `Ctrl+F` jumps to search.
+4. **As a Citizen**:
    - Click **Report Issue**, fill in the title, description, location, category, and priority, and submit. All three text fields are required, and a duplicate active issue (same title and location) is rejected.
-   - Your dashboard table and summary counts only show issues *you* reported.
+   - Your dashboard table and summary counts only show issues *you* reported; filters apply within that scope.
    - Select a row and click **View Details** to see the full record.
-4. **As an Admin**:
+5. **As an Admin**:
    - The dashboard shows *every* issue reported by any citizen, plus live counts.
    - Admins cannot report issues; they manage the ones citizens submit.
    - Select an issue and use **Update Status**, **Assign Department**, or **Update Priority** to manage it.
    - Use **Delete** to remove an issue (with confirmation).
-   - Use **Users** to view every registered account and its role.
-5. Click **Logout** at any time to return to the auth screen.
+   - Use **Users** to view every registered account and its role. From that dialog, **Create Admin** adds another admin, and **Remove Admin** deletes another admin account (not yourself or the last admin).
+6. **Change your password** with the **Change Password** button next to **Logout**. Enter the current password, the new password, and the confirmation. New passwords must be 6–100 characters and different from the current one. Admins cannot use the default `admin123`.
+7. Click **Logout** at any time to return to the auth screen.
 
-Every successful registration, report, update, or delete is written to `data/` immediately. Closing the app and relaunching from the same directory restores the same users, password hashes, issues, and issue-ID counter.
+Every successful registration, report, update, delete, admin change, or password change is written to `data/` immediately. Closing the app and relaunching from the same directory restores the same users, password hashes, issues, and issue-ID counter.
 
 ## Default Admin Account
 
@@ -231,7 +265,9 @@ Seeded automatically **only when no admin account exists** (for example, on the 
 
 If the `admin` username is already taken by a non-admin account (possible only if the data files were edited by hand), the app seeds `admin2`, `admin3`, etc. instead.
 
-> ⚠️ This is a hardcoded demo credential. The password is salted and hashed before being stored, but the credential itself is public — change or remove it before any real deployment. See [Known Limitations](#known-limitations).
+When an admin logs in with the seeded password, the app detects it and offers an immediate **Change Password** dialog. Admins cannot set their password back to `admin123`, and new admin accounts cannot be created with it.
+
+> ⚠️ The seeded credential is still hardcoded and public; the login prompt is a mitigation, not a replacement for changing the password before any real deployment. See [Known Limitations](#known-limitations).
 
 ## Data Persistence
 
@@ -270,7 +306,7 @@ nextIssueId=2
 
 Files are written as UTF-8. Previous versions appear as `users.csv.bak`, `issues.csv.bak`, and `meta.properties.bak`; unreadable user/issue files are preserved as `<file>.corrupt-<timestamp>`.
 
-- **What survives:** registered users, password hashes, issues and all their fields, and the issue-ID counter.
+- **What survives:** registered users (including added admins and changed passwords), password hashes, issues and all their fields, and the issue-ID counter.
 - **What does not survive:** the login session (the app always starts at the Login/Register screen) and window size/position.
 - **Passwords:** only salted PBKDF2-HMAC-SHA256 hashes are written — never plaintext.
 - **CSV format:** RFC 4180 quoting, so commas, quotes, and multiline descriptions round-trip correctly. Files are UTF-8.
@@ -287,23 +323,26 @@ Files are written as UTF-8. Previous versions appear as `users.csv.bak`, `issues
 - Passwords use the JDK's PBKDF2 implementation with a per-user salt; a dedicated library (Argon2id/bcrypt) and full password policy/rotation are preferable for production.
 - Single-user desktop app — no networking/multi-client support.
 - Single process at a time — there is no file locking, so two concurrent instances can overwrite each other's changes.
-- No encryption at rest: issues are plain-text CSV. Password hashes and salts are the only sensitive stored values.
-- No account management (password change/reset, creating admins, additional roles).
+- No encryption at rest: issues, names, usernames, and password hashes/salts are stored in plain-text CSV, protected only by OS file permissions.
+- Account management is intentionally limited: users can change their own password, and admins can create/remove admins. There is no forgotten-password reset, citizen deletion, or additional role type.
+- There is no audit trail for account changes or issue updates, and no comments/timeline on issues.
 - Duplicate detection is intentionally narrow: same reporter + exact title + exact location while the issue is still active.
 - When a save fails after the ID counter has been written, one issue ID may be skipped (never reused).
 - Data lives in the working directory's `data/` folder; launching from a different directory starts with a different dataset.
 - `.bak` files are never restored automatically — recovery is manual.
-- Tests cover the CSV/store/manager layers, not the Swing UI.
+- Tests cover the CSV/store/manager/filter/account-rule layers, not the Swing UI.
 
 ## Possible Improvements
 
 - Move to a real database (SQLite/H2) or JSON with schema migration if the dataset grows
-- Use a dedicated password-hashing library (Argon2id/bcrypt) and add password change/reset flows
+- Use a dedicated password-hashing library (Argon2id/bcrypt) and add a forgotten-password reset flow
+- Add a first-run setup wizard instead of seeding a known admin credential
 - Add file locking (or a single-instance guard) to protect against concurrent runs
 - Provide an in-app "restore from .bak" action instead of manual file recovery
 - Encrypt issue data at rest if it may contain sensitive details
-- Add search/filter controls to the issue table (column sorting is already available)
-- Expand the test suite (currently CSV/store/manager-level) to cover more edge cases and UI flows
+- Add issue comments and an audit trail of status/priority/department changes
+- Add CSV export and in-app backups
+- Expand the test suite to cover Swing UI flows
 - Migrate to a build tool (Maven/Gradle) for dependency and packaging management
 - Add email/SMS notifications when an issue's status changes
-- Add account management and additional admin roles
+- Add additional roles (for example, department staff) and citizen account deletion

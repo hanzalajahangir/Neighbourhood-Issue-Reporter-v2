@@ -2,7 +2,11 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.stream.Stream;
@@ -35,6 +39,19 @@ public class TestRunner {
         run("persistence: passwords are hashed on disk", TestRunner::testPasswordsAreHashedOnDisk);
         run("persistence: failed user save rolls back", TestRunner::testSaveFailureRollsBack);
         run("persistence: failed issue save rolls back", TestRunner::testIssueSaveFailureRollsBack);
+        run("persistence: persisted id counter is never rolled back", TestRunner::testIssueSaveFailureKeepsIdReserved);
+
+        run("filter: text search", TestRunner::testFilterTextSearch);
+        run("filter: dropdown fields and combinations", TestRunner::testFilterDropdowns);
+        run("filter: time ranges", TestRunner::testFilterTimeRanges);
+        run("account: password change rules and persistence", TestRunner::testPasswordChange);
+        run("account: stale user objects cannot change passwords", TestRunner::testStaleUserCannotChangePassword);
+        run("account: default admin password detection", TestRunner::testDefaultAdminPasswordDetection);
+        run("account: admin creation and persistence", TestRunner::testAdminCreation);
+        run("account: admin removal rules and persistence", TestRunner::testAdminRemoval);
+        run("account: failed password change rolls back", TestRunner::testPasswordChangeSaveFailureRollsBack);
+        run("account: failed admin creation rolls back", TestRunner::testAdminCreationSaveFailureRollsBack);
+        run("account: failed admin removal rolls back", TestRunner::testAdminRemovalSaveFailureRollsBack);
 
         cleanupTempDirs();
 
@@ -359,9 +376,16 @@ public class TestRunner {
         DataStore store = tempStore();
         UserManager users = new UserManager(store);
         check(users.register("citizen1", "secret1", "Citizen One"), "registration should succeed");
+        check(users.createAdmin("admin2", "adminSecret2", "Admin Two"),
+                "admin creation should succeed");
+        User citizen = users.login("citizen1", "secret1");
+        check(users.changePassword(citizen, "secret1", "newSecret1") == null,
+                "password change should succeed");
 
         String contents = read(store.getDataDir().resolve("users.csv"));
-        check(!contents.contains("secret1"), "plaintext password must not be written to disk");
+        check(!contents.contains("secret1"), "plaintext registration password must not be written");
+        check(!contents.contains("newSecret1"), "plaintext changed password must not be written");
+        check(!contents.contains("adminSecret2"), "plaintext admin password must not be written");
         check(!contents.contains("admin123"), "seeded admin password must not be written to disk");
         check(contents.contains("passwordHash"), "the header should document the hash column");
     }
@@ -406,10 +430,352 @@ public class TestRunner {
         check(retry.getId() == 1, "a rolled-back id should not be consumed");
     }
 
+    private static void testIssueSaveFailureKeepsIdReserved() {
+        DataStore store = tempStore();
+        IssueManager issues = new IssueManager(store);
+        Path issuesFile = store.getDataDir().resolve("issues.csv");
+        try {
+            Files.createDirectory(issuesFile);
+            Files.write(issuesFile.resolve("blocker"), new byte[]{1});
+        } catch (IOException e) {
+            throw new RuntimeException("Could not obstruct the issues file.", e);
+        }
+
+        boolean threw = false;
+        try {
+            issues.addIssue(issue("Blocked", "Description", "Location", "Other", "Low", "citizen1"));
+        } catch (DataStoreException expected) {
+            threw = true;
+        }
+
+        check(threw, "a failed issue write after the counter was saved should surface an error");
+        check(issues.getAllIssues().isEmpty(), "the failed issue should be rolled back");
+
+        try {
+            Files.delete(issuesFile.resolve("blocker"));
+            Files.delete(issuesFile);
+            Files.deleteIfExists(store.getDataDir().resolve("issues.csv.bak"));
+        } catch (IOException e) {
+            throw new RuntimeException("Could not remove the issues-file obstruction.", e);
+        }
+
+        Issue retry = issue("Retry", "Description", "Location", "Other", "Low", "citizen1");
+        check(issues.addIssue(retry), "an issue should be addable after the obstruction is removed");
+        check(retry.getId() == 2, "an id whose counter was persisted must not be reused");
+
+        IssueManager reloaded = new IssueManager(store);
+        check(reloaded.getAllIssues().size() == 1, "one issue should survive the restart");
+        check(reloaded.getAllIssues().get(0).getId() == 2,
+                "the skipped id should remain skipped after a restart");
+    }
+
+    // ── Filters ──────────────────────────────────────────────
+    private static void testFilterTextSearch() {
+        Issue pothole = issue("Pothole", "Deep hole in the road", "Main St", "Road", "High", "alice");
+        Issue leak = issue("Leak", "Water everywhere", "Elm St", "Water", "Medium", "bob");
+        List<Issue> all = Arrays.asList(pothole, leak);
+        IssueFilter filter = new IssueFilter();
+
+        check(filter.apply(all).size() == 2, "empty filter should match every issue");
+
+        filter.setSearchText("POTHOLE");
+        check(filter.apply(all).size() == 1 && filter.matches(pothole),
+                "title search should be case-insensitive");
+
+        filter.setSearchText("everywhere");
+        check(filter.matches(leak) && !filter.matches(pothole),
+                "description should be searchable");
+
+        filter.setSearchText("elm st");
+        check(filter.matches(leak) && !filter.matches(pothole),
+                "location should be searchable");
+
+        filter.setSearchText("ALICE");
+        check(filter.matches(pothole) && !filter.matches(leak),
+                "reporter should be searchable");
+
+        filter.setSearchText("no such issue");
+        check(filter.apply(all).isEmpty(), "unmatched text should return no issues");
+        check(filter.apply(null).isEmpty(), "a null list should filter to an empty list");
+    }
+
+    private static void testFilterDropdowns() {
+        Issue resolvedRoad = issue("Pothole", "Deep hole", "Main St", "Road", "Critical", "alice");
+        resolvedRoad.setStatus("Resolved");
+        resolvedRoad.setDepartment("Roads Dept");
+
+        Issue pendingRoad = issue("Cracked path", "Cracked pavement", "Oak St", "Road", "Medium", "bob");
+
+        Issue pendingWater = issue("Leak", "Water leak", "Elm St", "Water", "High", "carol");
+        pendingWater.setDepartment("Water Dept");
+
+        List<Issue> all = Arrays.asList(resolvedRoad, pendingRoad, pendingWater);
+        IssueFilter filter = new IssueFilter();
+
+        filter.setStatus("Resolved");
+        check(filter.apply(all).size() == 1 && filter.matches(resolvedRoad),
+                "status filter should select matching issues");
+        filter.setStatus("Pending");
+        check(filter.apply(all).size() == 2, "status filter should support Pending");
+
+        filter.setStatus(IssueFilter.ALL);
+        filter.setCategory("Road");
+        check(filter.apply(all).size() == 2, "category filter should select matching issues");
+
+        filter.setCategory(IssueFilter.ALL);
+        filter.setPriority("High");
+        check(filter.apply(all).size() == 1 && filter.matches(pendingWater),
+                "priority filter should select matching issues");
+
+        filter.setPriority(IssueFilter.ALL);
+        filter.setDepartment(IssueFilter.UNASSIGNED);
+        check(filter.apply(all).size() == 1 && filter.matches(pendingRoad),
+                "Unassigned should be selectable as a department");
+
+        filter.setDepartment("Water Dept");
+        check(filter.apply(all).size() == 1 && filter.matches(pendingWater),
+                "named departments should filter correctly");
+
+        IssueFilter combined = new IssueFilter(
+                "", "Pending", "Road", "Medium", IssueFilter.UNASSIGNED, IssueFilter.ANY_TIME);
+        check(combined.apply(all).size() == 1 && combined.matches(pendingRoad),
+                "all active filters should be combined with AND");
+    }
+
+    private static void testFilterTimeRanges() {
+        LocalDate today = LocalDate.now();
+        Issue todayIssue = datedIssue(1, "Today", today);
+        Issue sixDaysOld = datedIssue(2, "Six days", today.minusDays(6));
+        Issue sevenDaysOld = datedIssue(3, "Seven days", today.minusDays(7));
+        Issue tenDaysOld = datedIssue(4, "Ten days", today.minusDays(10));
+        Issue fortyDaysOld = datedIssue(5, "Forty days", today.minusDays(40));
+        List<Issue> all = Arrays.asList(
+                todayIssue, sixDaysOld, sevenDaysOld, tenDaysOld, fortyDaysOld);
+
+        IssueFilter filter = new IssueFilter();
+        check(filter.apply(all).size() == 5, "Any time should include every issue");
+
+        filter.setTimeRange(IssueFilter.TODAY);
+        check(filter.apply(all).size() == 1 && filter.matches(todayIssue),
+                "Today should only include today's issues");
+
+        filter.setTimeRange(IssueFilter.LAST_7_DAYS);
+        List<Issue> lastSeven = filter.apply(all);
+        check(lastSeven.size() == 2 && lastSeven.contains(todayIssue) && lastSeven.contains(sixDaysOld),
+                "Last 7 days should include today and the previous six days");
+
+        filter.setTimeRange(IssueFilter.LAST_30_DAYS);
+        List<Issue> lastThirty = filter.apply(all);
+        check(lastThirty.size() == 4 && lastThirty.contains(tenDaysOld) && !lastThirty.contains(fortyDaysOld),
+                "Last 30 days should exclude older issues");
+
+        filter.setTimeRange("Not a real range");
+        check(filter.apply(all).size() == 5,
+                "an unknown time range should safely fall back to Any time");
+    }
+
+    // ── Accounts ─────────────────────────────────────────────
+    private static void testPasswordChange() {
+        DataStore store = tempStore();
+        UserManager users = new UserManager(store);
+        check(users.register("citizen1", "secret1", "Citizen One"), "registration should succeed");
+        User citizen = users.login("citizen1", "secret1");
+        check(citizen != null, "citizen should log in");
+
+        check(users.validatePasswordChange(citizen, "wrong", "newsecret") != null,
+                "wrong current password should be rejected");
+        check(users.validatePasswordChange(citizen, "secret1", "12345") != null,
+                "short new password should be rejected");
+        check(users.validatePasswordChange(citizen, "secret1", "secret1") != null,
+                "unchanged password should be rejected");
+        check(users.changePassword(citizen, "secret1", "newsecret") == null,
+                "valid password change should succeed");
+
+        check(users.login("citizen1", "secret1") == null,
+                "old password should stop working");
+        check(users.login("citizen1", "newsecret") != null,
+                "new password should work immediately");
+
+        UserManager reloaded = new UserManager(store);
+        check(reloaded.login("citizen1", "newsecret") != null,
+                "changed password should survive a restart");
+        check(reloaded.login("citizen1", "secret1") == null,
+                "old password should remain invalid after restart");
+    }
+
+    private static void testStaleUserCannotChangePassword() {
+        DataStore store = tempStore();
+        UserManager users = new UserManager(store);
+        check(users.register("citizen1", "secret1", "Citizen One"), "registration should succeed");
+        check(users.login("citizen1", "secret1") != null, "canonical citizen should log in");
+
+        User stale = new Citizen("citizen1", "secret1", "Stale Copy");
+        check(users.validatePasswordChange(stale, "secret1", "newsecret") != null,
+                "a non-managed user object should be rejected");
+        check(users.changePassword(stale, "secret1", "newsecret") != null,
+                "stale user object should not report a successful change");
+        check(users.login("citizen1", "secret1") != null,
+                "canonical account password should be unchanged");
+        check(users.login("citizen1", "newsecret") == null,
+                "stale object must not change the stored password");
+    }
+
+    private static void testDefaultAdminPasswordDetection() {
+        DataStore store = tempStore();
+        UserManager users = new UserManager(store);
+        User admin = users.login("admin", "admin123");
+        check(admin != null, "seeded admin should log in");
+        check(users.isUsingDefaultAdminPassword(admin),
+                "seeded admin should be detected as using the default password");
+
+        check(users.changePassword(admin, "admin123", "stronger1") == null,
+                "admin should be able to change the default password");
+        check(!users.isUsingDefaultAdminPassword(admin),
+                "default-password detection should stop after the change");
+        check(users.changePassword(admin, "stronger1", "admin123") != null,
+                "admins should not be allowed to set the default password");
+
+        check(users.register("citizen1", "admin123", "Citizen One"),
+                "citizen registration should still work");
+        User citizen = users.login("citizen1", "admin123");
+        check(!users.isUsingDefaultAdminPassword(citizen),
+                "default-password detection should only apply to admins");
+
+        UserManager reloaded = new UserManager(store);
+        check(reloaded.login("admin", "stronger1") != null,
+                "changed admin password should survive a restart");
+    }
+
+    private static void testAdminCreation() {
+        DataStore store = tempStore();
+        UserManager users = new UserManager(store);
+
+        check(users.validateAdminCreation("admin2", "admin123", "Admin Two") != null,
+                "new admins should not use the default password");
+        check(users.validateAdminCreation("admin", "secret2", "Admin Two") != null,
+                "admin creation should enforce username uniqueness");
+        check(users.validateAdminCreation("admin2", "secret2", "Admin Two") == null,
+                "valid admin details should pass validation");
+        check(users.createAdmin("admin2", "secret2", "Admin Two"),
+                "admin creation should succeed");
+        check(!users.createAdmin("admin2", "secret3", "Duplicate Admin"),
+                "duplicate admin username should be rejected");
+
+        User admin2 = users.login("admin2", "secret2");
+        check(admin2 != null && "Admin".equals(admin2.getRole()),
+                "created account should be able to log in as an admin");
+
+        UserManager reloaded = new UserManager(store);
+        check(reloaded.login("admin2", "secret2") != null,
+                "created admin should survive a restart");
+    }
+
+    private static void testAdminRemoval() {
+        DataStore store = tempStore();
+        UserManager users = new UserManager(store);
+        check(users.createAdmin("admin2", "secret2", "Admin Two"), "second admin should be created");
+        check(users.register("citizen1", "secret1", "Citizen One"), "citizen should be created");
+
+        check(users.validateAdminRemoval("admin", "admin") != null,
+                "admins should not be able to remove themselves");
+        check(users.validateAdminRemoval("citizen1", "admin") != null,
+                "citizen accounts should not be removable here");
+        check(users.validateAdminRemoval("missing", "admin") != null,
+                "missing admin should be rejected");
+        check(users.validateAdminRemoval("admin2", "citizen1") != null,
+                "non-admin actors should not remove admins");
+        check(users.validateAdminRemoval("admin2", "admin") == null,
+                "removing another admin should be allowed");
+
+        check(users.removeAdmin("admin2", "admin"), "admin removal should succeed");
+        check(users.login("admin2", "secret2") == null, "removed admin should not log in");
+        check(users.login("admin", "admin123") != null, "remaining admin should still log in");
+
+        UserManager reloaded = new UserManager(store);
+        check(reloaded.login("admin2", "secret2") == null,
+                "removed admin should stay removed after restart");
+        check(reloaded.login("citizen1", "secret1") != null,
+                "removing an admin should not affect citizens");
+    }
+
+    private static void testPasswordChangeSaveFailureRollsBack() {
+        DataStore store = tempStore();
+        UserManager users = new UserManager(store);
+        check(users.register("citizen1", "secret1", "Citizen One"), "registration should succeed");
+        User citizen = users.login("citizen1", "secret1");
+
+        breakDataDir(store);
+        boolean threw = false;
+        try {
+            users.changePassword(citizen, "secret1", "newsecret");
+        } catch (DataStoreException expected) {
+            threw = true;
+        }
+        check(threw, "a failed password save should surface a DataStoreException");
+        check(users.login("citizen1", "secret1") != null,
+                "failed password change should restore the old password");
+        check(users.login("citizen1", "newsecret") == null,
+                "failed password change should not activate the new password");
+
+        restoreDataDir(store);
+    }
+
+    private static void testAdminCreationSaveFailureRollsBack() {
+        DataStore store = tempStore();
+        UserManager users = new UserManager(store);
+        int before = users.getAllUsers().size();
+
+        breakDataDir(store);
+        boolean threw = false;
+        try {
+            users.createAdmin("admin2", "secret2", "Admin Two");
+        } catch (DataStoreException expected) {
+            threw = true;
+        }
+        check(threw, "a failed admin save should surface a DataStoreException");
+        check(users.getAllUsers().size() == before, "failed admin creation should roll back");
+        check(users.login("admin2", "secret2") == null,
+                "rolled-back admin should not be able to log in");
+
+        restoreDataDir(store);
+        check(users.createAdmin("admin2", "secret2", "Admin Two"),
+                "admin creation should work after the directory is restored");
+    }
+
+    private static void testAdminRemovalSaveFailureRollsBack() {
+        DataStore store = tempStore();
+        UserManager users = new UserManager(store);
+        check(users.createAdmin("admin2", "secret2", "Admin Two"), "second admin should be created");
+        int before = users.getAllUsers().size();
+
+        breakDataDir(store);
+        boolean threw = false;
+        try {
+            users.removeAdmin("admin2", "admin");
+        } catch (DataStoreException expected) {
+            threw = true;
+        }
+        check(threw, "a failed admin removal should surface a DataStoreException");
+        check(users.getAllUsers().size() == before, "failed admin removal should roll back");
+        check(users.login("admin2", "secret2") != null,
+                "rolled-back admin should still be able to log in");
+
+        restoreDataDir(store);
+        check(users.removeAdmin("admin2", "admin"),
+                "admin removal should work after the directory is restored");
+    }
+
     // ── Helpers ──────────────────────────────────────────────
     private static Issue issue(String title, String description, String location,
                                String category, String priority, String reportedBy) {
         return new Issue(title, description, location, category, priority, reportedBy);
+    }
+
+    private static Issue datedIssue(int id, String title, LocalDate date) {
+        String timestamp = date.atTime(9, 0).format(
+                DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm"));
+        return new Issue(id, title, "Description", "Location", "Other", "Low",
+                "Pending", "Unassigned", "citizen1", timestamp);
     }
 
     private static DataStore tempStore() {

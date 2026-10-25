@@ -84,14 +84,20 @@ public class IssueManager {
         nextId = assignedId + 1;
 
         try {
-            // Metadata first: if the issue file write fails, the rollback below
-            // keeps memory and disk consistent (the counter may skip one ID,
-            // but an ID is never reused).
             store.saveNextIssueId(nextId);
-            store.saveIssues(issues);
         } catch (DataStoreException e) {
+            // The counter was not persisted, so this id can safely be reused.
             issues.remove(issue);
             nextId = assignedId;
+            throw e;
+        }
+
+        try {
+            store.saveIssues(issues);
+        } catch (DataStoreException e) {
+            // The counter may already contain nextId. Keep it advanced so the
+            // failed id is never handed out again, even in this session.
+            issues.remove(issue);
             throw e;
         }
         return true;

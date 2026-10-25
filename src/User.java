@@ -58,6 +58,34 @@ public abstract class User {
     String getSalt()         { return salt; }
     int getIterations()      { return iterations; }
 
+    /**
+     * Replaces the stored password with a fresh hash and salt. Used by
+     * {@link UserManager} for password changes.
+     */
+    void updatePassword(String password) {
+        if (password == null || password.isEmpty()) {
+            throw new IllegalArgumentException("Password cannot be empty.");
+        }
+        String newSalt = createSalt();
+        String newHash = hashPassword(password, newSalt, DEFAULT_ITERATIONS);
+        this.salt = newSalt;
+        this.passwordHash = newHash;
+        this.iterations = DEFAULT_ITERATIONS;
+    }
+
+    /**
+     * Restores the previous credentials when a password-change save fails.
+     * Package-private so only the user store can call it.
+     */
+    void restoreCredentials(String passwordHash, String salt, int iterations) {
+        if (passwordHash == null || salt == null || iterations <= 0) {
+            throw new IllegalArgumentException("Stored user credentials are incomplete.");
+        }
+        this.passwordHash = passwordHash;
+        this.salt = salt;
+        this.iterations = iterations;
+    }
+
     public boolean checkPassword(String password) {
         if (password == null) return false;
         String candidate = hashPassword(password, salt, iterations);

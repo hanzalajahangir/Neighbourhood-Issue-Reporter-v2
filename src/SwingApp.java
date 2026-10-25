@@ -1,7 +1,16 @@
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.TableRowSorter;
 import java.awt.*;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.List;
 
 public class SwingApp extends JFrame {
@@ -10,16 +19,26 @@ public class SwingApp extends JFrame {
     private static final Color TEXT_MUTED = new Color(89, 99, 110);
     private static final Color PRIMARY = new Color(37, 99, 235);
     private static final Dimension AUTH_FIELD_SIZE = new Dimension(320, 34);
+    private static final DateTimeFormatter ISSUE_DATE_FORMAT =
+            DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm");
 
     private final DataStore store;
     private final IssueManager issueManager;
     private final UserManager userManager;
+    private final IssueFilter issueFilter = new IssueFilter();
 
     private User currentUser;
     private JTable issueTable;
     private DefaultTableModel issueTableModel;
     private JLabel titleLabel;
     private JLabel statsLabel;
+    private JTextField searchField;
+    private JComboBox<String> statusFilterBox;
+    private JComboBox<String> categoryFilterBox;
+    private JComboBox<String> priorityFilterBox;
+    private JComboBox<String> departmentFilterBox;
+    private JComboBox<String> timeFilterBox;
+    private boolean updatingFilterControls;
 
     public SwingApp(DataStore store) {
         if (store == null) {
@@ -109,6 +128,7 @@ public class SwingApp extends JFrame {
                 return;
             }
             showDashboard();
+            promptForDefaultAdminPassword();
         });
         return panel;
     }
@@ -264,13 +284,26 @@ public class SwingApp extends JFrame {
         titleBox.add(titleLabel);
         titleBox.add(statsLabel);
 
+        JButton changePasswordButton = new JButton("Change Password");
+        changePasswordButton.addActionListener(e -> showChangePasswordDialog());
         JButton logoutButton = new JButton("Logout");
         logoutButton.addActionListener(e -> {
+            resetFilterModel();
             currentUser = null;
             showAuthPanel();
         });
+        JPanel accountActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        accountActions.setOpaque(false);
+        accountActions.add(changePasswordButton);
+        accountActions.add(logoutButton);
+
         header.add(titleBox, BorderLayout.WEST);
-        header.add(logoutButton, BorderLayout.EAST);
+        header.add(accountActions, BorderLayout.EAST);
+
+        JPanel top = new JPanel(new BorderLayout(0, 10));
+        top.setOpaque(false);
+        top.add(header, BorderLayout.NORTH);
+        top.add(createFilterBar(), BorderLayout.CENTER);
 
         issueTableModel = new DefaultTableModel(
                 new String[]{"ID", "Title", "Category", "Priority", "Status", "Department", "Location", "Reported By", "Date"}, 0
@@ -282,18 +315,189 @@ public class SwingApp extends JFrame {
         };
         issueTable = new JTable(issueTableModel);
         issueTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        issueTable.setAutoCreateRowSorter(true);
+        TableRowSorter<DefaultTableModel> sorter = new TableRowSorter<>(issueTableModel);
+        sorter.setComparator(8, (left, right) -> {
+            LocalDateTime leftDate = parseIssueDate(left);
+            LocalDateTime rightDate = parseIssueDate(right);
+            if (leftDate != null && rightDate != null) {
+                return leftDate.compareTo(rightDate);
+            }
+            return String.valueOf(left).compareTo(String.valueOf(right));
+        });
+        issueTable.setRowSorter(sorter);
         issueTable.setRowHeight(24);
         issueTable.getTableHeader().setReorderingAllowed(false);
 
-        root.add(header, BorderLayout.NORTH);
+        root.add(top, BorderLayout.NORTH);
         root.add(new JScrollPane(issueTable), BorderLayout.CENTER);
         root.add(createActionPanel(), BorderLayout.SOUTH);
 
         setContentPane(root);
+        getRootPane().setDefaultButton(null);
+        installDashboardShortcuts(root);
         refreshDashboard();
         revalidate();
         repaint();
+    }
+
+    private JPanel createFilterBar() {
+        JPanel bar = new JPanel(new GridLayout(0, 1, 0, 6));
+        bar.setBackground(CARD_BACKGROUND);
+        bar.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(222, 228, 238)),
+                new EmptyBorder(10, 12, 10, 12)
+        ));
+
+        searchField = new JTextField();
+        styleFilterField(searchField, 230);
+        searchField.setToolTipText("Search title, description, location, or reporter (Ctrl+F)");
+
+        statusFilterBox = new JComboBox<>(withAll(Issue.STATUSES));
+        categoryFilterBox = new JComboBox<>(withAll(Issue.CATEGORIES));
+        priorityFilterBox = new JComboBox<>(withAll(Issue.PRIORITIES));
+        departmentFilterBox = new JComboBox<>(departmentFilterOptions());
+        timeFilterBox = new JComboBox<>(IssueFilter.TIME_RANGES);
+        styleFilterField(statusFilterBox, 110);
+        styleFilterField(categoryFilterBox, 120);
+        styleFilterField(priorityFilterBox, 110);
+        styleFilterField(departmentFilterBox, 145);
+        styleFilterField(timeFilterBox, 115);
+
+        searchField.setText(issueFilter.getSearchText());
+        statusFilterBox.setSelectedItem(issueFilter.getStatus());
+        categoryFilterBox.setSelectedItem(issueFilter.getCategory());
+        priorityFilterBox.setSelectedItem(issueFilter.getPriority());
+        departmentFilterBox.setSelectedItem(issueFilter.getDepartment());
+        timeFilterBox.setSelectedItem(issueFilter.getTimeRange());
+
+        JPanel firstRow = createFilterRow();
+        addFilterControl(firstRow, "Search", searchField);
+        addFilterControl(firstRow, "Status", statusFilterBox);
+        addFilterControl(firstRow, "Category", categoryFilterBox);
+
+        JButton clearButton = new JButton("Clear Filters");
+        clearButton.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        clearButton.addActionListener(e -> clearFilters());
+
+        JPanel secondRow = createFilterRow();
+        addFilterControl(secondRow, "Priority", priorityFilterBox);
+        addFilterControl(secondRow, "Department", departmentFilterBox);
+        addFilterControl(secondRow, "Reported", timeFilterBox);
+        secondRow.add(clearButton);
+
+        bar.add(firstRow);
+        bar.add(secondRow);
+
+        searchField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) { filterChanged(); }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) { filterChanged(); }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) { filterChanged(); }
+        });
+        statusFilterBox.addActionListener(e -> filterChanged());
+        categoryFilterBox.addActionListener(e -> filterChanged());
+        priorityFilterBox.addActionListener(e -> filterChanged());
+        departmentFilterBox.addActionListener(e -> filterChanged());
+        timeFilterBox.addActionListener(e -> filterChanged());
+
+        return bar;
+    }
+
+    private JPanel createFilterRow() {
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        row.setOpaque(false);
+        return row;
+    }
+
+    private void addFilterControl(JPanel row, String label, JComponent component) {
+        JLabel filterLabel = new JLabel(label);
+        filterLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        filterLabel.setForeground(TEXT_MUTED);
+        row.add(filterLabel);
+        row.add(component);
+    }
+
+    private void styleFilterField(JComponent component, int width) {
+        component.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        component.setPreferredSize(new Dimension(width, 28));
+    }
+
+    private String[] withAll(String[] options) {
+        String[] result = new String[options.length + 1];
+        result[0] = IssueFilter.ALL;
+        System.arraycopy(options, 0, result, 1, options.length);
+        return result;
+    }
+
+    private String[] departmentFilterOptions() {
+        String[] result = new String[Issue.DEPARTMENTS.length + 2];
+        result[0] = IssueFilter.ALL;
+        result[1] = IssueFilter.UNASSIGNED;
+        System.arraycopy(Issue.DEPARTMENTS, 0, result, 2, Issue.DEPARTMENTS.length);
+        return result;
+    }
+
+    private void filterChanged() {
+        if (updatingFilterControls) {
+            return;
+        }
+        issueFilter.setSearchText(searchField.getText());
+        issueFilter.setStatus((String) statusFilterBox.getSelectedItem());
+        issueFilter.setCategory((String) categoryFilterBox.getSelectedItem());
+        issueFilter.setPriority((String) priorityFilterBox.getSelectedItem());
+        issueFilter.setDepartment((String) departmentFilterBox.getSelectedItem());
+        issueFilter.setTimeRange((String) timeFilterBox.getSelectedItem());
+        refreshDashboard();
+    }
+
+    private void clearFilters() {
+        updatingFilterControls = true;
+        resetFilterModel();
+        searchField.setText("");
+        statusFilterBox.setSelectedItem(IssueFilter.ALL);
+        categoryFilterBox.setSelectedItem(IssueFilter.ALL);
+        priorityFilterBox.setSelectedItem(IssueFilter.ALL);
+        departmentFilterBox.setSelectedItem(IssueFilter.ALL);
+        timeFilterBox.setSelectedItem(IssueFilter.ANY_TIME);
+        updatingFilterControls = false;
+        refreshDashboard();
+        searchField.requestFocusInWindow();
+    }
+
+    private void resetFilterModel() {
+        issueFilter.setSearchText("");
+        issueFilter.setStatus(IssueFilter.ALL);
+        issueFilter.setCategory(IssueFilter.ALL);
+        issueFilter.setPriority(IssueFilter.ALL);
+        issueFilter.setDepartment(IssueFilter.ALL);
+        issueFilter.setTimeRange(IssueFilter.ANY_TIME);
+    }
+
+    private void installDashboardShortcuts(JPanel root) {
+        InputMap inputMap = root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW);
+        ActionMap actionMap = root.getActionMap();
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK),
+                "focusIssueSearch");
+        actionMap.put("focusIssueSearch", new AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                searchField.requestFocusInWindow();
+                searchField.selectAll();
+            }
+        });
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "clearIssueFilters");
+        actionMap.put("clearIssueFilters", new AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                clearFilters();
+            }
+        });
     }
 
     private JPanel createActionPanel() {
@@ -396,13 +600,17 @@ public class SwingApp extends JFrame {
     }
 
     private void refreshDashboard() {
+        if (currentUser == null) {
+            return;
+        }
         titleLabel.setText("Welcome, " + currentUser.getName() + " (" + currentUser.getRole() + ")");
         List<Issue> issues = isAdmin()
                 ? issueManager.getAllIssues()
                 : issueManager.getByUser(currentUser.getUsername());
+        List<Issue> filtered = issueFilter.apply(issues);
 
         issueTableModel.setRowCount(0);
-        for (Issue issue : issues) {
+        for (Issue issue : filtered) {
             issueTableModel.addRow(new Object[]{
                     issue.getId(),
                     issue.getTitle(),
@@ -416,10 +624,10 @@ public class SwingApp extends JFrame {
             });
         }
 
-        statsLabel.setText("Total: " + issues.size()
-                + "    Pending: " + countStatus(issues, "Pending")
-                + "    In Progress: " + countStatus(issues, "In Progress")
-                + "    Resolved: " + countStatus(issues, "Resolved"));
+        statsLabel.setText("Showing " + filtered.size() + " of " + issues.size()
+                + "    Pending: " + countStatus(filtered, "Pending")
+                + "    In Progress: " + countStatus(filtered, "In Progress")
+                + "    Resolved: " + countStatus(filtered, "Resolved"));
     }
 
     private int countStatus(List<Issue> issues, String status) {
@@ -452,6 +660,21 @@ public class SwingApp extends JFrame {
                 + "Department  : " + issue.getDepartment() + "\n"
                 + "Reported By : " + issue.getReportedBy() + "\n"
                 + "Date        : " + issue.getDateReported();
+    }
+
+    private static LocalDateTime parseIssueDate(Object value) {
+        if (value == null) {
+            return null;
+        }
+        String text = value.toString().trim();
+        if (text.isEmpty()) {
+            return null;
+        }
+        try {
+            return LocalDateTime.parse(text, ISSUE_DATE_FORMAT);
+        } catch (DateTimeParseException e) {
+            return null;
+        }
     }
 
     private void updateSelectedIssue(String label, String[] options) {
@@ -513,6 +736,44 @@ public class SwingApp extends JFrame {
     }
 
     private void showUsers() {
+        JDialog dialog = new JDialog(this, "Registered Users", true);
+        JTextArea usersArea = new JTextArea(formatUsers(), 12, 42);
+        usersArea.setEditable(false);
+        usersArea.setFont(new Font("Consolas", Font.PLAIN, 13));
+
+        JButton createAdminButton = new JButton("Create Admin");
+        JButton removeAdminButton = new JButton("Remove Admin");
+        JButton closeButton = new JButton("Close");
+        createAdminButton.addActionListener(e -> {
+            if (showCreateAdminDialog(dialog)) {
+                usersArea.setText(formatUsers());
+            }
+        });
+        removeAdminButton.addActionListener(e -> {
+            if (showRemoveAdminDialog(dialog)) {
+                usersArea.setText(formatUsers());
+            }
+        });
+        closeButton.addActionListener(e -> dialog.dispose());
+
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        buttons.add(createAdminButton);
+        buttons.add(removeAdminButton);
+        buttons.add(closeButton);
+
+        JPanel content = new JPanel(new BorderLayout(10, 10));
+        content.setBorder(new EmptyBorder(12, 12, 12, 12));
+        content.add(new JScrollPane(usersArea), BorderLayout.CENTER);
+        content.add(buttons, BorderLayout.SOUTH);
+
+        dialog.setContentPane(content);
+        dialog.setSize(560, 420);
+        dialog.setMinimumSize(new Dimension(460, 320));
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+    }
+
+    private String formatUsers() {
         StringBuilder builder = new StringBuilder();
         for (User user : userManager.getAllUsers()) {
             builder.append(user.getUsername())
@@ -522,11 +783,187 @@ public class SwingApp extends JFrame {
                     .append(user.getName())
                     .append("\n");
         }
+        return builder.toString();
+    }
 
-        JTextArea usersArea = new JTextArea(builder.toString(), 10, 36);
-        usersArea.setEditable(false);
-        usersArea.setFont(new Font("Consolas", Font.PLAIN, 13));
-        JOptionPane.showMessageDialog(this, new JScrollPane(usersArea), "Registered Users", JOptionPane.INFORMATION_MESSAGE);
+    private boolean showCreateAdminDialog(Component parent) {
+        JTextField nameField = new JTextField();
+        JTextField usernameField = new JTextField();
+        JPasswordField passwordField = new JPasswordField();
+        JPasswordField confirmField = new JPasswordField();
+
+        JPanel form = new JPanel(new GridLayout(0, 2, 10, 10));
+        addField(form, "Full name", nameField);
+        addField(form, "Username", usernameField);
+        addField(form, "Password", passwordField);
+        addField(form, "Confirm password", confirmField);
+
+        while (true) {
+            int choice = JOptionPane.showConfirmDialog(
+                    parent, form, "Create Admin Account", JOptionPane.OK_CANCEL_OPTION);
+            if (choice != JOptionPane.OK_OPTION) {
+                return false;
+            }
+
+            String name = nameField.getText().trim();
+            String username = usernameField.getText().trim();
+            String password = new String(passwordField.getPassword());
+            String confirm = new String(confirmField.getPassword());
+
+            String error = userManager.validateAdminCreation(username, password, name);
+            if (error == null && !password.equals(confirm)) {
+                error = "Passwords do not match.";
+            }
+            if (error != null) {
+                showError(parent, error);
+                continue;
+            }
+
+            try {
+                if (!userManager.createAdmin(username, password, name)) {
+                    showError(parent, "Unable to create the admin account.");
+                    return false;
+                }
+            } catch (DataStoreException ex) {
+                showSaveError(parent, ex);
+                return false;
+            }
+
+            JOptionPane.showMessageDialog(
+                    parent,
+                    "Admin account \"" + username + "\" created.",
+                    "Admin Created",
+                    JOptionPane.INFORMATION_MESSAGE);
+            return true;
+        }
+    }
+
+    private boolean showRemoveAdminDialog(Component parent) {
+        List<String> removableAdmins = new ArrayList<>();
+        for (User user : userManager.getAllUsers()) {
+            if ("Admin".equalsIgnoreCase(user.getRole())
+                    && !user.getUsername().equalsIgnoreCase(currentUser.getUsername())) {
+                removableAdmins.add(user.getUsername());
+            }
+        }
+
+        if (removableAdmins.isEmpty()) {
+            showError(parent, "There are no other admin accounts to remove.");
+            return false;
+        }
+
+        String selected = (String) JOptionPane.showInputDialog(
+                parent,
+                "Select the admin account to remove:",
+                "Remove Admin",
+                JOptionPane.WARNING_MESSAGE,
+                null,
+                removableAdmins.toArray(new String[0]),
+                removableAdmins.get(0));
+        if (selected == null) {
+            return false;
+        }
+
+        String error = userManager.validateAdminRemoval(selected, currentUser.getUsername());
+        if (error != null) {
+            showError(parent, error);
+            return false;
+        }
+
+        int confirm = JOptionPane.showConfirmDialog(
+                parent,
+                "Remove admin account \"" + selected + "\"?",
+                "Confirm Remove Admin",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+        if (confirm != JOptionPane.YES_OPTION) {
+            return false;
+        }
+
+        try {
+            if (!userManager.removeAdmin(selected, currentUser.getUsername())) {
+                showError(parent, "Unable to remove that admin account.");
+                return false;
+            }
+        } catch (DataStoreException ex) {
+            showSaveError(parent, ex);
+            return false;
+        }
+
+        JOptionPane.showMessageDialog(
+                parent,
+                "Admin account \"" + selected + "\" removed.",
+                "Admin Removed",
+                JOptionPane.INFORMATION_MESSAGE);
+        return true;
+    }
+
+    private void showChangePasswordDialog() {
+        if (currentUser == null) {
+            return;
+        }
+
+        JPasswordField currentField = new JPasswordField();
+        JPasswordField newField = new JPasswordField();
+        JPasswordField confirmField = new JPasswordField();
+
+        JPanel form = new JPanel(new GridLayout(0, 2, 10, 10));
+        addField(form, "Current password", currentField);
+        addField(form, "New password", newField);
+        addField(form, "Confirm new password", confirmField);
+
+        while (true) {
+            int choice = JOptionPane.showConfirmDialog(
+                    this, form, "Change Password", JOptionPane.OK_CANCEL_OPTION);
+            if (choice != JOptionPane.OK_OPTION) {
+                return;
+            }
+
+            String current = new String(currentField.getPassword());
+            String newPassword = new String(newField.getPassword());
+            String confirm = new String(confirmField.getPassword());
+
+            if (!newPassword.equals(confirm)) {
+                showError("New passwords do not match.");
+                continue;
+            }
+
+            String error;
+            try {
+                error = userManager.changePassword(currentUser, current, newPassword);
+            } catch (DataStoreException ex) {
+                showSaveError(ex);
+                return;
+            }
+            if (error != null) {
+                showError(error);
+                continue;
+            }
+
+            JOptionPane.showMessageDialog(
+                    this,
+                    "Your password was changed.",
+                    "Password Changed",
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+    }
+
+    private void promptForDefaultAdminPassword() {
+        if (!userManager.isUsingDefaultAdminPassword(currentUser)) {
+            return;
+        }
+
+        int choice = JOptionPane.showConfirmDialog(
+                this,
+                "You are signed in with the default admin password, which is publicly documented.\n\n"
+                        + "Change it now?",
+                "Default Admin Password",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+        if (choice == JOptionPane.YES_OPTION) {
+            showChangePasswordDialog();
+        }
     }
 
     private Issue getSelectedIssue() {
@@ -545,12 +982,20 @@ public class SwingApp extends JFrame {
     }
 
     private void showError(String message) {
-        JOptionPane.showMessageDialog(this, message, "Error", JOptionPane.ERROR_MESSAGE);
+        showError(this, message);
+    }
+
+    private void showError(Component parent, String message) {
+        JOptionPane.showMessageDialog(parent, message, "Error", JOptionPane.ERROR_MESSAGE);
     }
 
     private void showSaveError(DataStoreException ex) {
+        showSaveError(this, ex);
+    }
+
+    private void showSaveError(Component parent, DataStoreException ex) {
         JOptionPane.showMessageDialog(
-                this,
+                parent,
                 "Your change could not be saved, so it was not applied.\n\n" + ex.getMessage(),
                 "Save Error",
                 JOptionPane.ERROR_MESSAGE);
